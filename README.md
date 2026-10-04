@@ -375,19 +375,24 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
     `planned_revoc_revision` / `planned_successor_revision`（确认将占用的两个
     连续修订号）；
   - `ready` 与 `blockers[]`：原许可不存在/非有效（`source_not_effective`）、
-    接替申请不存在/非待审（`successor_not_pending`）、仍有干扰或窗口命中时
-    `ready=false` 并逐项列出（预演始终返回 200，状态问题放在 `blockers` 而非
-    直接报错，便于运营查看现状）。
+    原许可仍持有**未解除的紧急占频**（`emergency_license_protected`；紧急占用
+    只能经专门解除结束，不能作为交接原许可）、接替申请不存在/非待审
+    （`successor_not_pending`）、仍有干扰或窗口命中时 `ready=false` 并逐项列出
+    （预演始终返回 200，状态问题放在 `blockers` 而非直接报错，便于运营查看
+    现状）。
 - `POST /api/license-transfers`，请求体在预演字段外追加
   `{"expected_revision": n}`：与所有既有写操作**共用同一修订号锁**，在锁内
   **重新计算**。确认顺序：原许可与接替申请是否存在（未知 → 404 `not_found`）
   → 原许可是否**仍有效**（必须 `approved`；暂停/已撤销 → 409
-  `source_not_effective`）→ 接替申请是否**仍待审**（已撤销 → 409
-  `already_revoked`；已批准/暂停 → 409 `successor_not_pending`）→ 修订号是否
-  为当前值（过期 → 409 `stale_revision`）→ **排除原许可后**按当前带宽重算
-  接替申请的干扰与窗口命中（窗口 → 409 `restriction_window`；其他许可干扰 →
-  409 `interference`）。任一不满足都**整笔拒绝**：许可、候补队列、修订号
-  **均不变**（不会出现只撤销未批准）。
+  `source_not_effective`）→ 原许可是否持有**未解除的紧急占频**（生效紧急许可
+  只能由专门解除结束 → 409 `emergency_license_protected`）→ 接替申请是否
+  **仍待审**（已撤销 → 409 `already_revoked`；已批准/暂停 → 409
+  `successor_not_pending`）→ 修订号是否为当前值（过期 → 409
+  `stale_revision`）→ **排除原许可后**按当前带宽重算接替申请的干扰与窗口命中
+  （窗口 → 409 `restriction_window`；其他许可干扰 → 409 `interference`）。任一
+  不满足都**整笔拒绝**：许可、候补队列、紧急占频记录、修订号**均不变**（不会
+  出现只撤销未批准，也不会留下已撤销许可却仍生效的紧急占频）。已解除紧急占频
+  的原许可此时是普通已撤销许可，按前述 `source_not_effective` 规则拒绝。
 
 **整笔生效时（一次提交）**
 
@@ -414,6 +419,14 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 - 原许可与接替申请必须**不同**（相同 → 422 `same_application`，明细走统一
   校验信封）；ID 必须 ≥ 1、修订号必须 ≥ 0（结构性非法 → 422
   `validation_failed`）。
+- **生效紧急许可不得交接**：原许可对应一条**未解除**的紧急占频时，预演在
+  `blockers` 中给出 `emergency_license_protected`，确认在共用修订仲裁内返回
+  409 `emergency_license_protected`（`details` 附 `application_id` / `status` /
+  `current_revision` / `emergency_occupation_id` /
+  `emergency_approval_revision`），原许可、接替申请、候补、紧急占频记录与修订号
+  **均不变**。紧急占频只能由 `POST
+  /api/emergency-occupations/{id}/release` 专门解除；解除后原许可成为普通已撤销
+  许可，再交接按 `source_not_effective` 拒绝。
 - 另写一条不可变 `license_transfer_events`（以撤销修订号为主键关联）记录
   `source_application_id` / `successor_application_id` /
   `successor_approval_revision` / `reason`，**仅作审计关联**；它不改变、也不
@@ -485,8 +498,10 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 - 被强制暂停的普通许可**普通恢复一律拒绝**：409 `force_suspended`
   （`details.force_suspended_by` 给出紧急申请）；对它再次普通暂停同样 409
   `force_suspended`。
-- 紧急许可**不得普通暂停或普通撤销**：均返回 409
-  `emergency_license_protected`；占用**只能通过解除结束**。
+- 紧急许可**不得普通暂停、普通撤销或作为换机交接的原许可**：普通暂停/撤销
+  返回 409 `emergency_license_protected`；换机交接预演在 `blockers` 中给出同码、
+  确认返回 409 `emergency_license_protected`（许可、接替申请、候补、占频记录与
+  修订号均不变）；占用**只能通过解除结束**。
 
 **解除（按暂停顺序重裁，整笔原子提交）**
 
@@ -745,8 +760,8 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | `POST` | `/api/restriction-windows/{id}/release` | **解除管制窗口**（窗口 ID + 预期修订号；只影响后续裁决，不审批候补） |
 | `GET` | `/api/restriction-windows` | 列出生效窗口（`include_inactive`/`status` 可含已解除） |
 | `GET` | `/api/restriction-windows/{id}` | 查询单个窗口（生效中或已解除） |
-| `POST` | `/api/license-transfers/preview` | **换机许可交接预演**（只读：当前修订号、排除原许可后的干扰、命中窗口；不改状态） |
-| `POST` | `/api/license-transfers` | **确认换机交接**（原许可 + 接替申请 + 预期修订号；撤销与批准占两个连续修订号，再 FIFO 重裁候补） |
+| `POST` | `/api/license-transfers/preview` | **换机许可交接预演**（只读：当前修订号、排除原许可后的干扰、命中窗口；原许可持有未解除紧急占频时给 `emergency_license_protected` 阻断；不改状态） |
+| `POST` | `/api/license-transfers` | **确认换机交接**（原许可 + 接替申请 + 预期修订号；撤销与批准占两个连续修订号，再 FIFO 重裁候补；原许可持有未解除紧急占频 → 409 `emergency_license_protected`，整笔不变） |
 | `POST` | `/api/emergency-occupations/preview` | **紧急占频预演**（只读：当前修订号、将强制暂停的普通许可、互扰的紧急许可、命中窗口；不改状态） |
 | `POST` | `/api/emergency-occupations` | **确认紧急占用**（待审申请 + 预期修订号；先强制暂停普通许可各占一修订号，再批准紧急申请） |
 | `POST` | `/api/emergency-occupations/{id}/release` | **解除紧急占用**（紧急申请 ID + 预期修订号；撤销紧急许可→按暂停顺序重裁恢复→FIFO 重裁候补，整笔原子） |
@@ -794,7 +809,7 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | 409 | `source_not_effective` | 换机交接的原许可**不是当前有效许可**（处于待审/暂停/已撤销；`details.status` 给出当前状态；许可、队列、修订号均不变） |
 | 409 | `successor_not_pending` | 换机交接的接替申请**已不是待审**（已批准/暂停；已撤销用 `already_revoked`；`details.status`/`approval_revision` 给出当前状态；不改许可、队列与修订号） |
 | 409 | `emergency_occupation_conflict` | 紧急占频申请与**另一张生效紧急许可**互扰（紧急不能压紧急；`details.conflicts[]` 附冲突对象；整笔不占用，许可、队列、修订号均不变） |
-| 409 | `emergency_license_protected` | 对**生效紧急许可**普通暂停或普通撤销（紧急占用只能由专门解除结束；`details.status` 给出当前状态；不改状态、不占修订号） |
+| 409 | `emergency_license_protected` | 对**生效紧急许可**普通暂停、普通撤销，或把它作为**换机交接原许可**（紧急占用只能由专门解除结束；暂停/撤销时 `details.status` 给出当前状态；交接确认时 `details` 另附 `application_id`/`current_revision`/`emergency_occupation_id`/`emergency_approval_revision`，交接预演在 `blockers` 中给同码；均不改状态、不占修订号） |
 | 409 | `force_suspended` | 对**被生效紧急占用强制暂停的普通许可**执行普通暂停或普通恢复（`details.force_suspended_by` 给出紧急申请；不改状态、不占修订号；此类许可可普通撤销） |
 | 404 | `emergency_occupation_not_found` | 解除或查询一个**从未有过紧急占用**的紧急申请 ID |
 | 409 | `emergency_occupation_not_active` | **重复解除**一个已经解除的紧急占用（`details.released_revision` 给出解除修订号；不改状态、不占修订号） |
@@ -1685,6 +1700,38 @@ curl -s "http://localhost:8000/api/revision/compare?base_revision=1&target_revis
 
 重启服务后 `current_revision`、有效集合、候补队列、保护带宽与交接历史均保持
 不变（`GUARD_BAND` 不覆盖已生效值）。
+
+**附：生效紧急许可不能作为交接原许可（预演阻断、确认 409、整笔不变）**
+
+紧急占频只能经专门解除结束。下例中申请 9 以紧急占用获批（修订号 7），申请 10
+是待审接替申请；沿用相同的原许可 ID、接替申请 ID 与确认时的预期修订号调用：
+
+```bash
+# 预演：ready=false，blockers 说明不可交接（只读，不占修订号）
+curl -s -X POST http://localhost:8000/api/license-transfers/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_application_id":9,"successor_application_id":10,"reason":"设备换机"}'
+# {"current_revision":7,"ready":false,
+#  "blockers":[{"code":"emergency_license_protected",
+#               "field":"source_application_id","status":"approved",
+#               "message":"source application 9 holds an active emergency occupation; ..."}],
+#  "successor_application":{"id":10,"status":"pending",...}, ...}
+
+# 确认：共用修订仲裁内返回 409，原许可/接替申请/候补/占频记录/修订号均不变
+curl -s -i -X POST http://localhost:8000/api/license-transfers \
+  -H 'Content-Type: application/json' \
+  -d '{"source_application_id":9,"successor_application_id":10,
+       "expected_revision":7,"reason":"设备换机"}'
+# HTTP/1.1 409 Conflict
+# {"error":{"code":"emergency_license_protected",
+#   "message":"source application 9 holds an active emergency occupation; release ...",
+#   "details":{"application_id":9,"status":"approved","current_revision":7,
+#              "emergency_occupation_id":3,"emergency_approval_revision":7}}}
+```
+
+须先走专门解除（`POST /api/emergency-occupations/9/release` 携当前
+`expected_revision`）；解除后申请 9 为普通**已撤销**许可，再交接按既有规则返回
+409 `source_not_effective`。普通（非紧急）有效许可的交接结果与历史事件语义不变。
 
 ### 6.20 预约自动审批：预约 → 改期/取消 → 到期重裁（通过/阻塞）→ 失效与历史
 

@@ -66,6 +66,26 @@ def transfer(client, source, successor, expected, reason="swap"):
     )
 
 
+def confirm_emergency(client, app_id, expected, reason="burst"):
+    r = client.post(
+        "/api/emergency-occupations",
+        json={
+            "application_id": app_id,
+            "expected_revision": expected,
+            "reason": reason,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def release_emergency(client, app_id, expected, reason="clear"):
+    return client.post(
+        f"/api/emergency-occupations/{app_id}/release",
+        json={"expected_revision": expected, "reason": reason},
+    )
+
+
 class TestPreview:
     def test_preview_is_read_only_and_lists_current_revision(self, client):
         a = submit(client, 100, 110, "A")
@@ -497,6 +517,162 @@ class TestWaitlist:
         assert (
             client.get("/api/revision/current").json()["current_revision"] == 2
         )
+
+
+class TestEmergencyProtection:
+    """An active emergency license can only end via its dedicated release.
+
+    Handing such a license over as the swap source used to rehearse as
+    ready and the confirmation revoked the emergency license and approved
+    the successor while leaving the emergency occupation record live.  The
+    preview must now list an ``emergency_license_protected`` blocker and the
+    confirmation must reject with 409 ``emergency_license_protected`` inside
+    the shared revision arbitration, leaving everything untouched.
+    """
+
+    def test_preview_lists_emergency_protection_blocker(self, client):
+        # The emergency application occupies spectrum straight from pending;
+        # a disjoint band means no ordinary license has to be force-suspended.
+        em = submit(client, 100, 110, "emergency source")
+        body = confirm_emergency(client, em, 0)  # emergency approval rev 1
+        b = submit(client, 105, 108, "successor")
+
+        r = transfer_preview(client, em, b)
+        assert r.status_code == 200, r.text
+        preview = r.json()
+        assert preview["ready"] is False
+        blocker = next(
+            item
+            for item in preview["blockers"]
+            if item["code"] == "emergency_license_protected"
+        )
+        assert blocker["field"] == "source_application_id"
+        assert blocker["status"] == "approved"
+        # The interference computation still runs and remains clear (the
+        # source would be excluded as in any other rehearsal).
+        assert preview["has_conflicts"] is False
+
+        # Read-only as always.
+        assert client.get(f"/api/applications/{em}").json()["status"] == "approved"
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 1
+        )
+        assert (
+            client.get(f"/api/emergency-occupations/{em}").json()[
+                "occupation"
+            ]["status"]
+            == "active"
+        )
+        assert body["emergency_approval_revision"] == 1
+
+    def test_confirm_rejects_and_changes_nothing(self, client):
+        em = submit(client, 100, 110, "emergency source")
+        confirm_emergency(client, em, 0)  # revision 1
+        b = submit(client, 105, 108, "successor")
+        # A queued standby that must not be touched by the rejected swap.
+        d = submit(client, 200, 205, "standby")
+        register(client, b)
+        register(client, d)
+
+        r = transfer(client, em, b, expected=1)
+        assert r.status_code == 409, r.text
+        err = r.json()["error"]
+        assert err["code"] == "emergency_license_protected"
+        assert err["details"]["application_id"] == em
+        assert err["details"]["status"] == "approved"
+        assert err["details"]["current_revision"] == 1
+        assert err["details"]["emergency_approval_revision"] == 1
+
+        # Source, successor, waitlist, occupation record and revision: all
+        # exactly as before the attempt.
+        assert client.get(f"/api/applications/{em}").json()["status"] == "approved"
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        cur = client.get("/api/revision/current").json()
+        assert cur["current_revision"] == 1
+        assert cur["effective_application_ids"] == [em]
+        assert cur["active_emergency_application_ids"] == [em]
+        assert cur["force_suspended_application_ids"] == []
+        assert queue_ids(client) == [b, d]
+        occupation = client.get(
+            f"/api/emergency-occupations/{em}"
+        ).json()["occupation"]
+        assert occupation["status"] == "active"
+        assert "released_revision" not in occupation
+
+    def test_stale_revision_still_rejected_inside_same_arbitration(self, client):
+        em = submit(client, 100, 110, "emergency source")
+        confirm_emergency(client, em, 0)  # revision 1
+        b = submit(client, 105, 108, "successor")
+
+        # Status protection precedes the revision check, same precedence as
+        # the ordinary source_not_effective guard; a stale expected revision
+        # therefore does not mask it.
+        r = transfer(client, em, b, expected=0)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "emergency_license_protected"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 1
+        )
+
+    def test_protection_holds_when_emergency_force_suspended_others(self, client):
+        a = submit(client, 100, 110, "ordinary A")
+        approve(client, a, 0)  # revision 1
+        # Emergency band clashes with A, so A is force-suspended before the
+        # emergency license is approved at revision 3.
+        em = submit(client, 104, 109, "emergency source")
+        body = confirm_emergency(client, em, 1)
+        assert body["force_suspended_application_ids"] == [a]
+        b = submit(client, 105, 108, "successor")
+
+        preview = transfer_preview(client, em, b).json()
+        assert any(
+            item["code"] == "emergency_license_protected"
+            for item in preview["blockers"]
+        )
+        r = transfer(client, em, b, expected=3)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "emergency_license_protected"
+
+        # Nothing moved: A stays force-suspended, the emergency stays live.
+        cur = client.get("/api/revision/current").json()
+        assert cur["current_revision"] == 3
+        assert cur["active_emergency_application_ids"] == [em]
+        assert cur["force_suspended_application_ids"] == [a]
+        assert client.get(f"/api/applications/{a}").json()["status"] == "suspended"
+
+    def test_released_emergency_source_falls_back_to_non_effective_rule(
+        self, client
+    ):
+        em = submit(client, 100, 110, "emergency source")
+        confirm_emergency(client, em, 0)  # revision 1
+        b = submit(client, 105, 108, "successor")
+
+        # The dedicated release is still the only way the emergency ends.
+        r = release_emergency(client, em, expected=1)
+        assert r.status_code == 200, r.text
+        release_revision = r.json()["revision"]
+
+        # The released emergency application is now an ordinary revoked
+        # license, so the pre-existing non-effective source rule applies;
+        # there is no emergency_license_protected blocker anymore.
+        preview = transfer_preview(client, em, b).json()
+        codes = [item["code"] for item in preview["blockers"]]
+        assert "source_not_effective" in codes
+        assert "emergency_license_protected" not in codes
+
+        r = transfer(client, em, b, expected=release_revision)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "source_not_effective"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"]
+            == release_revision
+        )
+        occupation = client.get(
+            f"/api/emergency-occupations/{em}"
+        ).json()["occupation"]
+        assert occupation["status"] == "released"
+        assert occupation["released_revision"] == release_revision
 
 
 class TestHistory:

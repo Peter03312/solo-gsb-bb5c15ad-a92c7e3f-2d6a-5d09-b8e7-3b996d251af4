@@ -381,6 +381,16 @@ echo "    (P can still be revoked as an ordinary force-suspended license:)"
 post "/api/applications/$P_ID/revoke" '{"reason":"scrapped anyway"}' \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revoked P at revision", d["revision"])'
 
+echo "== 47b. the active emergency license cannot be handed over in an equipment swap =="
+HSUCC=$(mke "swap successor" 712 714); HSUCC_ID=$(echo "$HSUCC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/license-transfers/preview "{\"source_application_id\":$E_ID,\"successor_application_id\":$HSUCC_ID,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("preview ready:", d["ready"], "; blocker codes:", [b["code"] for b in d["blockers"]])'
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post /api/license-transfers "{\"source_application_id\":$E_ID,\"successor_application_id\":$HSUCC_ID,\"expected_revision\":$EM_REV,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("confirm ->", e["code"], "; occupation:", e["details"]["emergency_occupation_id"], "; revision untouched:", e["details"]["current_revision"])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective:", d["effective_application_ids"], "; active emergencies:", d["active_emergency_application_ids"], "; current revision:", d["current_revision"])'
+curl -s "$BASE/api/applications/$HSUCC_ID" | python3 -c 'import json,sys; print("successor stays:", json.load(sys.stdin)["status"])'
+
 echo "== 48. a second emergency clashing with the active one is refused (emergency never suspends emergency) =="
 E2=$(mke "second burst" 750 760); E2_ID=$(echo "$E2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
