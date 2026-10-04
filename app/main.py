@@ -132,7 +132,11 @@ see once the source is excluded from the effective set, and the active
 restriction windows it hits; it never mutates state.  The confirmation adds
 the expected revision and runs inside the same singleton revision
 arbitration as every other writer: it re-checks that the source is still
-effective, the successor is still pending, the revision is current, and
+effective, that the source does not hold an unreleased emergency occupation
+(an emergency license ends only through the dedicated emergency release, so
+such a handover is refused with ``emergency_license_protected`` and leaves
+the occupation and every revision untouched), the successor is still
+pending, the revision is current, and
 that (with the source removed) no license interferes and no restriction
 window is hit.  Only then does the whole transaction take effect: the
 ordinary source revocation consumes one revision and the ordinary successor
@@ -734,6 +738,28 @@ def emergency_application_ids(
 ) -> set[int]:
     """Application ids that currently hold an active emergency license."""
     return {occ.emergency_application_id for occ in occupations}
+
+
+def load_active_emergency_for(
+    session, application_id: int
+) -> EmergencyOccupation | None:
+    """The still-active emergency occupation held by ``application_id``.
+
+    Returns the occupation row while its emergency license is effective
+    (``released_revision`` is NULL), or ``None`` if the application never
+    occupied spectrum in an emergency or its occupation was already released.
+    Shared by the live-state guards: ordinary suspend/revoke and an
+    effective->pending handover must never end an emergency license; only the
+    dedicated emergency release may.
+    """
+    return (
+        session.query(EmergencyOccupation)
+        .filter(
+            EmergencyOccupation.emergency_application_id == application_id,
+            EmergencyOccupation.released_revision.is_(None),
+        )
+        .one_or_none()
+    )
 
 
 def load_emergency_licenses(session) -> list[License]:
@@ -1541,6 +1567,24 @@ def transfer_preview_body(
                 "message": (
                     f"source application {source.id} is {source.status}; only an "
                     "approved, non-suspended, non-revoked license can be handed over"
+                ),
+                "status": source.status,
+            }
+        )
+    elif load_active_emergency_for(session, source.id) is not None:
+        # The source is an effective license granted by an emergency
+        # occupation that has not been released.  An emergency license ends
+        # exclusively through the dedicated emergency release, so the
+        # handover is impossible: list it among the non-fatal blockers
+        # instead of (wrongly) adjudicating a committable swap.
+        blockers.append(
+            {
+                "code": E_EMERGENCY_LICENSE_PROTECTED,
+                "field": "source_application_id",
+                "message": (
+                    f"source application {source.id} holds an active emergency "
+                    "occupation; it can only be ended by releasing the emergency "
+                    "occupation and cannot be handed over"
                 ),
                 "status": source.status,
             }
@@ -3393,14 +3437,8 @@ def revoke_application(
                         details={"status": row.status},
                     )
                 if row.status == "approved":
-                    active_emergency = (
-                        session.query(EmergencyOccupation)
-                        .filter(
-                            EmergencyOccupation.emergency_application_id
-                            == application_id,
-                            EmergencyOccupation.released_revision.is_(None),
-                        )
-                        .one_or_none()
+                    active_emergency = load_active_emergency_for(
+                        session, application_id
                     )
                     if active_emergency is not None:
                         # Emergency licenses end exclusively through the
@@ -3501,13 +3539,7 @@ def suspend_application(
                     )
                 if (
                     row.status == "approved"
-                    and session.query(EmergencyOccupation)
-                    .filter(
-                        EmergencyOccupation.emergency_application_id
-                        == application_id,
-                        EmergencyOccupation.released_revision.is_(None),
-                    )
-                    .one_or_none()
+                    and load_active_emergency_for(session, application_id)
                     is not None
                 ):
                     # An emergency license can only end through the dedicated
@@ -5007,9 +5039,10 @@ def preview_license_transfer(payload: LicenseTransferRequest) -> dict[str, Any]:
     as ``expected_revision``), the successor's interference against the
     effective set with the source license excluded, and the active
     restriction windows it would hit.  Status problems (missing/non-effective
-    source, non-pending successor) are listed under ``blockers`` rather than
-    raised, so the rehearsal always shows the current picture; nothing is
-    mutated and no revision is consumed.
+    source, an active emergency occupation held by the source, non-pending
+    successor) are listed under ``blockers`` rather than raised, so the
+    rehearsal always shows the current picture; nothing is mutated and no
+    revision is consumed.
     """
     _validate_transfer_ids(payload)
     with SessionLocal() as session:
@@ -5023,12 +5056,15 @@ def confirm_license_transfer(
     """Atomically revoke one effective license and approve its successor.
 
     Runs in the shared singleton revision arbitration.  Inside the lock the
-    source must still be effective, the successor still pending, the expected
-    revision must be current, and the successor (adjudicated with the source
-    removed from the effective set, under the live guard band and against
-    every active restriction window) must be free of conflicts and window
-    hits.  Otherwise the whole handover is rejected with no change to
-    licenses, the waitlist or the revision.
+    source must still be effective, must not hold an unreleased emergency
+    occupation (an emergency license ends only through the dedicated release;
+    HTTP 409 ``emergency_license_protected``), the successor must still be
+    pending, the expected revision must be current, and the successor
+    (adjudicated with the source removed from the effective set, under the
+    live guard band and against every active restriction window) must be free
+    of conflicts and window hits.  Otherwise the whole handover is rejected
+    with no change to licenses, the emergency occupation, the waitlist or the
+    revision.
 
     On success the ordinary source revocation consumes the first revision
     and the ordinary successor approval the next consecutive one; a queued
@@ -5078,6 +5114,31 @@ def confirm_license_transfer(
                         details={
                             "application_id": source.id,
                             "status": source.status,
+                        },
+                    )
+                active_source_emergency = load_active_emergency_for(
+                    session, source.id
+                )
+                if active_source_emergency is not None:
+                    # An emergency license can only end through the dedicated
+                    # emergency release: revoking it as a handover source would
+                    # leave the occupation audit row active and the forced
+                    # licenses orphaned.  Re-checked here under the lock, so a
+                    # grab/release racing the handover is seen consistently;
+                    # nothing is mutated and no revision is consumed.
+                    raise APIError(
+                        E_EMERGENCY_LICENSE_PROTECTED,
+                        f"source application {source.id} holds an active "
+                        "emergency occupation; it can only be ended by "
+                        "releasing the emergency occupation and cannot be "
+                        "handed over",
+                        status_code=409,
+                        details={
+                            "application_id": source.id,
+                            "status": source.status,
+                            "emergency_approval_revision": (
+                                active_source_emergency.emergency_approval_revision
+                            ),
                         },
                     )
                 if successor.status == "revoked":

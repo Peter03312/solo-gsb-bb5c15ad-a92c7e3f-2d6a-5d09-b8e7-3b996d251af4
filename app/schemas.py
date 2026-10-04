@@ -166,9 +166,10 @@ class LicenseTransferConfirmRequest(LicenseTransferRequest):
     On success the source revocation and the successor approval consume two
     consecutive revisions; a queued successor leaves the waitlist first and
     the remaining standbys are re-adjudicated by the normal FIFO rules.  A
-    stale revision, a status change, renewed interference or a restriction
-    window hit rejects the whole transaction without touching licenses, the
-    queue or the revision.
+    stale revision, a status change, a source holding an unreleased emergency
+    occupation, renewed interference or a restriction window hit rejects the
+    whole transaction without touching licenses, the emergency occupation,
+    the queue or the revision.
     """
 
     expected_revision: int = Field(ge=0)

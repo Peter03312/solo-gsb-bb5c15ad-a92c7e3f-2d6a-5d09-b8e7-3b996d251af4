@@ -381,6 +381,15 @@ echo "    (P can still be revoked as an ordinary force-suspended license:)"
 post "/api/applications/$P_ID/revoke" '{"reason":"scrapped anyway"}' \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revoked P at revision", d["revision"])'
 
+echo "== 47b. an active emergency license cannot be a handover source (preview blocker, confirm 409, nothing changes) =="
+HS=$(mke "handover successor" 750 755); HS_ID=$(echo "$HS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/license-transfers/preview "{\"source_application_id\":$E_ID,\"successor_application_id\":$HS_ID,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("preview ready:", d["ready"], "; blocker codes:", [b["code"] for b in d["blockers"]])'
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post /api/license-transfers "{\"source_application_id\":$E_ID,\"successor_application_id\":$HS_ID,\"expected_revision\":$EM_REV,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("handover confirm ->", e["code"], "; emergency approval rev:", e["details"]["emergency_approval_revision"])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revision still", d["current_revision"], "; emergency still effective:", '$E_ID' in d["effective_application_ids"], "; successor still pending id '$HS_ID' not effective:", '$HS_ID' not in d["effective_application_ids"])'
+
 echo "== 48. a second emergency clashing with the active one is refused (emergency never suspends emergency) =="
 E2=$(mke "second burst" 750 760); E2_ID=$(echo "$E2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')

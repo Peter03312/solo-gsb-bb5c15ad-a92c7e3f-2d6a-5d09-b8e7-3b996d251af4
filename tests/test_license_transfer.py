@@ -66,6 +66,24 @@ def transfer(client, source, successor, expected, reason="swap"):
     )
 
 
+def confirm_emergency(client, app_id, expected, reason="burst"):
+    return client.post(
+        "/api/emergency-occupations",
+        json={
+            "application_id": app_id,
+            "expected_revision": expected,
+            "reason": reason,
+        },
+    )
+
+
+def release_emergency(client, app_id, expected, reason="clear"):
+    return client.post(
+        f"/api/emergency-occupations/{app_id}/release",
+        json={"expected_revision": expected, "reason": reason},
+    )
+
+
 class TestPreview:
     def test_preview_is_read_only_and_lists_current_revision(self, client):
         a = submit(client, 100, 110, "A")
@@ -374,6 +392,151 @@ class TestConfirmRejections:
         )
         assert r.status_code == 422
         assert r.json()["error"]["code"] == "validation_failed"
+
+
+class TestEmergencyLicenseProtection:
+    """An active emergency license ends only through its dedicated release.
+
+    Using it as a handover source must not slip an ordinary revocation past
+    that guard: the preview lists the blocker and the confirm is a hard 409
+    inside the shared revision arbitration, leaving everything untouched.
+    """
+
+    def test_preview_blocks_handover_of_active_emergency_license(self, client):
+        a = submit(client, 100, 110, "A")
+        approve(client, a, 0)  # revision 1
+        em = submit(client, 104, 109, "emergency")
+        confirm_emergency(client, em, 1)  # A forced 2, em approved 3
+        b = submit(client, 105, 108, "B")
+
+        r = transfer_preview(client, em, b)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ready"] is False
+        blocker = next(
+            item
+            for item in body["blockers"]
+            if item["code"] == "emergency_license_protected"
+        )
+        assert blocker["field"] == "source_application_id"
+        assert blocker["status"] == "approved"
+        # Only the emergency guard fires: the successor itself is fine.
+        codes = [item["code"] for item in body["blockers"]]
+        assert codes.count("emergency_license_protected") == 1
+        assert "source_not_effective" not in codes
+        assert "successor_not_pending" not in codes
+
+        # Still read-only: license, successor, queue markers and revision.
+        assert client.get(f"/api/applications/{em}").json()["status"] == "approved"
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 3
+        )
+        occ = client.get(f"/api/emergency-occupations/{em}").json()["occupation"]
+        assert occ["status"] == "active"
+
+    def test_confirm_rejects_active_emergency_source_and_changes_nothing(
+        self, client
+    ):
+        a = submit(client, 100, 110, "A")
+        approve(client, a, 0)  # revision 1
+        em = submit(client, 104, 109, "emergency")
+        confirm_emergency(client, em, 1)  # A forced 2, em approved 3
+        # A queued successor: the queue must not be touched by the rejection.
+        b = submit(client, 105, 108, "B")
+        register(client, b)
+        assert queue_ids(client) == [b]
+
+        r = transfer(client, em, b, expected=3)
+        assert r.status_code == 409, r.text
+        err = r.json()["error"]
+        assert err["code"] == "emergency_license_protected"
+        assert err["details"] == {
+            "application_id": em,
+            "status": "approved",
+            "emergency_approval_revision": 3,
+        }
+
+        # Nothing moved: the emergency license is still effective, the forced
+        # ordinary license still suspended, the successor still queued/pending,
+        # the occupation still active and the revision unchanged.
+        cur = client.get("/api/revision/current").json()
+        assert cur["current_revision"] == 3
+        assert cur["effective_application_ids"] == [em]
+        assert cur["suspended_application_ids"] == [a]
+        assert cur["force_suspended_application_ids"] == [a]
+        assert cur["active_emergency_application_ids"] == [em]
+        assert cur["waitlist_application_ids"] == [b]
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        occ = client.get(f"/api/emergency-occupations/{em}").json()["occupation"]
+        assert occ["status"] == "active"
+        assert occ.get("released_revision") is None
+        # No handover history was written.
+        assert cur["license_transfers"] == []
+
+    def test_guard_fires_with_a_stale_expected_revision_too(self, client):
+        # The status/emergency guard precedes the revision check, so an
+        # emergency source is protected even when the caller is also stale.
+        a = submit(client, 100, 110, "A")
+        approve(client, a, 0)  # revision 1
+        em = submit(client, 104, 109, "emergency")
+        confirm_emergency(client, em, 1)  # revision 3
+        b = submit(client, 105, 108, "B")
+
+        r = transfer(client, em, b, expected=0)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "emergency_license_protected"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 3
+        )
+
+    def test_released_emergency_source_is_rejected_as_not_effective(self, client):
+        # Once the occupation is released the emergency application is an
+        # ordinary revoked license: the emergency guard no longer applies and
+        # the existing non-effective source rule rejects the handover.
+        em = submit(client, 500, 510, "emergency")
+        confirm_emergency(client, em, 0)  # approved 1
+        release_emergency(client, em, 1)  # revoked 2
+        b = submit(client, 505, 508, "B")
+
+        body = transfer_preview(client, em, b).json()
+        assert body["ready"] is False
+        assert any(
+            item["code"] == "source_not_effective" for item in body["blockers"]
+        )
+        assert not any(
+            item["code"] == "emergency_license_protected"
+            for item in body["blockers"]
+        )
+
+        r = transfer(client, em, b, expected=2)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "source_not_effective"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 2
+        )
+
+    def test_ordinary_effective_source_still_hands_over(self, client):
+        # The new guard must not change the normal handover outcome at all.
+        a = submit(client, 100, 110, "A")
+        approve(client, a, 0)
+        em = submit(client, 500, 510, "emergency")
+        # Disjoint from A: no forced suspension, the emergency takes rev 2.
+        confirm_emergency(client, em, 1)
+        b = submit(client, 105, 108, "B")
+
+        preview = transfer_preview(client, a, b).json()
+        assert preview["ready"] is True
+        assert preview["blockers"] == []
+
+        r = transfer(client, a, b, expected=2)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["transferred"] is True
+        # The unrelated emergency keeps running through the handover.
+        cur = client.get("/api/revision/current").json()
+        assert cur["effective_application_ids"] == [em, b]
+        assert cur["active_emergency_application_ids"] == [em]
 
 
 class TestRestrictionWindows:
